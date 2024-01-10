@@ -9,8 +9,6 @@ import copy
 import collections
 import torch.nn.functional as F
 from torch.autograd import Variable
-# from torch import threshold
-# from multiprocessing import reduction
 import torch.multiprocessing as mp
 import torch
 import torch.nn as nn
@@ -64,7 +62,7 @@ import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 import sys
-proj_dir = "/home_nfs/haitao/data/yht/DataCompletion/"
+proj_dir = "./"
 sys.path.append(proj_dir+"code/")
 
 import model
@@ -86,17 +84,9 @@ parser.add_argument('--device', type=str, required=True)
 parser.add_argument('--training_file', type=str, required=True, help='the file of training dataset')
 parser.add_argument('--validation_file',type=str, required=True, help='the file of val dataset')
 parser.add_argument('--test_file',type=str, required=True, help='the file of test dataset')
-parser.add_argument('--new_test_file',type=str, required=True, help='the file of test dataset')
 parser.add_argument('--edge_file',type=str, required=True, help='the file of edge file')
 parser.add_argument('--graph_file',type=str, required=True, help='the file of graph')
 parser.add_argument('--test',type=int, default=0)
-parser.add_argument('--resort_data',type=int, default=0)
-# device="cpu"
-# training_file="/home/hatim/data/DataCompletion/data/chengdu/train_output_dataset_0.2.txt"
-# validation_file="/home/hatim/data/DataCompletion/data/chengdu/val_output_dataset_0.2.txt"
-# test_file="/home/hatim/data/DataCompletion/data/chengdu/test_output_dataset_0.2.txt"
-# edge_file="/home/hatim/data/DataCompletion/data/chengdu/new_edge_dict.pk"
-# graph_file="/home/hatim/data/DataCompletion/data/chengdu/subgraphs_128.pk"
 
 # training parameters
 parser.add_argument('--train_batch_size', type=int, default=100)
@@ -112,25 +102,24 @@ parser.add_argument('--grad_clamp', type=float, default=10)
 parser.add_argument('--weight_decay', type=float, default=0.1)
 parser.add_argument('--interval_size', type=int, default=15)
 parser.add_argument('--data_ratio', type=float, default=1.0)
+parser.add_argument('--hist_size', type=int, default=8)
+parser.add_argument('--time_slot_num', type=int, default=12)
+parser.add_argument('--mask_rate', type=float, default=0.2)
 
-# model parameters
-# in_dim = 2
-# spatial_feature_dim = 2
-parser.add_argument('--use_meta', type=int, default=1)
-parser.add_argument('--use_sim', type=int, default=1)
+# for ablation study
 parser.add_argument('--use_global', type=int, default=1)
 parser.add_argument('--use_local', type=int, default=1)
 parser.add_argument('--use_fusion', type=int, default=1)
+
+# model parameters
 parser.add_argument('--out_spatial_dim', type=int, default=100)
 parser.add_argument('--out_temporal_dim', type=int, default=100)
 parser.add_argument('--graph_layer', type=int, default=2)
-parser.add_argument('--rnn_layer', type=int, default=2)
 parser.add_argument('--spatial_context_dim', type=int, default=100)
 parser.add_argument('--temporal_context_dim', type=int, default=100)
 parser.add_argument('--hidden_size', type=int, default=100)
-parser.add_argument('--threshold', type=float, default=0.1)
-parser.add_argument('--rep_scale_weight',type=float, default=10.0)
 parser.add_argument('--avg_speed_file', type=str, default=None)
+parser.add_argument('--weight_file', type=str, default=None)
 parser.add_argument('--lambda_weight', type=float, default=0.1)
 
 parser = parser.parse_args()
@@ -143,7 +132,6 @@ device = parser.device
 training_file=parser.training_file
 validation_file=parser.validation_file
 test_file=parser.test_file
-new_test_file=parser.new_test_file
 edge_file=parser.edge_file
 graph_file=parser.graph_file
 if device != "cpu" and torch.cuda.is_available():
@@ -168,32 +156,34 @@ early_stop_epoch=parser.early_stop_epoch
 grad_clamp=parser.grad_clamp
 weight_decay=parser.weight_decay
 
-use_meta = True if  parser.use_meta>0 else False
-use_sim = True if parser.use_sim>0 else False
+use_meta = False
+use_sim = True
+rnn_layer = 2
 use_global = True if parser.use_global>0 else False
 use_local = True if parser.use_local>0 else False
 use_fusion = True if parser.use_fusion>0 else False
 test = True if parser.test>0 else False
-resort_data = True if parser.resort_data>0 else False
 out_spatial_dim = parser.out_spatial_dim
 out_temporal_dim = parser.out_temporal_dim
 graph_layer = parser.graph_layer
-rnn_layer = parser.rnn_layer
 spatial_context_dim = parser.spatial_context_dim
 temporal_context_dim = parser.temporal_context_dim
-# assert spatial_context_dim == temporal_context_dim
 hidden_size = parser.hidden_size
-threshold = parser.threshold
-rep_scale_weight = parser.rep_scale_weight
 lambda_weight = parser.lambda_weight
 interval_size = parser.interval_size
 data_ratio = parser.data_ratio
+mask_rate = parser.mask_rate
 
-data.MyTrafficDataset.in_dim = 8
-data.MyTrafficDatasetPath.in_dim = 8
-data.MyTrafficDataset.time_slot_num = int(60//interval_size)
-data.MyTrafficDatasetPath.time_slot_num = int(60//interval_size)
+weight_file = parser.weight_file
 
+
+data.MyTrafficDataset.in_dim = parser.hist_size
+data.MyTrafficDatasetPath.in_dim = parser.hist_size
+data.MyTrafficDataset.time_slot_num = int(parser.time_slot_num*5//interval_size)
+data.MyTrafficDatasetPath.time_slot_num = int(parser.time_slot_num*5//interval_size)
+
+train_batch_size = 20 if parser.time_slot_num > 100 else train_batch_size
+test_batch_size = 40 if parser.time_slot_num > 100 else test_batch_size
 
 def my_collate_fn(batch):
     first_layer_idx = []
@@ -214,7 +204,11 @@ def my_collate_fn(batch):
         sim_mask += data['sim_mask']
         x += data['x']
         y += data['y']
-        g = data['graph']
+        # g = data['graph']
+        (u,v,node_idx,node_features) = data['graph']
+        g = dgl.graph((u,v),num_nodes=len(node_idx))
+        g.ndata['spatial_feature'] = torch.FloatTensor(node_features)
+        g.ndata['spatial_idx'] = torch.LongTensor(node_idx)
         
         g.ndata['batch_idx'] = torch.LongTensor([batch_idx for _ in range(g.num_nodes())])
         batch_g.append(g)
@@ -228,24 +222,7 @@ def train2(model, dataloader, val_dataloader, criterion, criterion_2, opt, opt_2
     
     model.train()
     train_loss, rep_sim_loss = [], []
-    # if use_sim:
-    #             # 辅助任务先训练一轮
-    #     for _ in tqdm(range(batch_per_ep)): 
-    #         val_first_layer_idx, val_weeks, val_minutes, val_batch_g, val_raw_traffic, val_y, val_mask, val_sim_mask = next(val_dataloader)
-    #         val_first_layer_idx, val_weeks, val_minutes, val_batch_g, val_raw_traffic, val_y, val_mask, val_sim_mask = \
-    #                         val_first_layer_idx.to(device, non_blocking=True), val_weeks.to(device, non_blocking=True), \
-    #                             val_minutes.to(device, non_blocking=True), val_batch_g.to(device), \
-    #                                 val_raw_traffic.to(device, non_blocking=True), val_y.to(device, non_blocking=True), \
-    #                                     val_mask.to(device, non_blocking=True), val_sim_mask.to(device, non_blocking=True)
-
-    #         _, val_new_predict = model(x=(val_batch_g, (val_raw_traffic, val_y), val_weeks, val_minutes, val_first_layer_idx, val_mask, val_sim_mask),auxillary=True)
-    #         minibatch_loss22 = criterion(val_new_predict, val_y, val_mask, val_sim_mask, reduction=True)
-    #         opt_2.zero_grad()
-    #         minibatch_loss22.backward()
-    #         for param in model.second_round_parameters():
-    #             if param.grad is not None:
-    #                 param.grad.data.clamp_(-grad_clamp, grad_clamp)
-    #         opt_2.step()      
+       
                 
     for _ in tqdm(range(batch_per_ep)): 
             data = next(dataloader)
@@ -259,24 +236,6 @@ def train2(model, dataloader, val_dataloader, criterion, criterion_2, opt, opt_2
             minibatch_loss2 = criterion(new_predict, y, mask, sim_mask, reduction=True)
 
 
-            # if use_sim:
-            #     # 辅助任务先训练一轮
-            #     val_first_layer_idx, val_weeks, val_minutes, val_batch_g, val_raw_traffic, val_y, val_mask, val_sim_mask = next(val_dataloader)
-            #     val_first_layer_idx, val_weeks, val_minutes, val_batch_g, val_raw_traffic, val_y, val_mask, val_sim_mask = \
-            #                         val_first_layer_idx.to(device, non_blocking=True), val_weeks.to(device, non_blocking=True), \
-            #                             val_minutes.to(device, non_blocking=True), val_batch_g.to(device), \
-            #                                 val_raw_traffic.to(device, non_blocking=True), val_y.to(device, non_blocking=True), \
-            #                                     val_mask.to(device, non_blocking=True), val_sim_mask.to(device, non_blocking=True)
-
-            #     for _ in range(3):
-            #         _, val_new_predict = model(x=(val_batch_g, (val_raw_traffic, val_y), val_weeks, val_minutes, val_first_layer_idx, val_mask, val_sim_mask),auxillary=True)
-            #         minibatch_loss22 = criterion(val_new_predict, val_y, val_mask, val_sim_mask, reduction=True)
-            #         opt_2.zero_grad()
-            #         minibatch_loss22.backward()
-            #         for param in model.second_round_parameters():
-            #             if param.grad is not None:
-            #                 param.grad.data.clamp_(-grad_clamp, grad_clamp)
-            #         opt_2.step()
             
 
             if use_meta:
@@ -299,29 +258,7 @@ def train2(model, dataloader, val_dataloader, criterion, criterion_2, opt, opt_2
                         meta_train_loss = criterion(meta_predict, val_y, val_mask, val_sim_mask, reduction=True)
                         diffopt.step(meta_train_loss)
                     
-                # if use_sim:
-                #     for _ in range(5):
-                #         opt_2.zero_grad()
-                #         _, meta_predict = model(x=(val_batch_g, val_y, val_weeks, val_minutes, val_first_layer_idx, val_mask, val_sim_mask),auxillary=True)
-                #         minibatch_loss1 = criterion(meta_predict, val_y, val_mask, val_sim_mask, reduction=True)
-
-                #         _, new_predict = model(x=(batch_g, y, weeks, minutes, first_layer_idx, mask, sim_mask),auxillary=True)
-                #         minibatch_loss2 = criterion(new_predict, y, mask, sim_mask, reduction=True)
-
-                #         (minibatch_loss2 + minibatch_loss1).backward()
-                #         for param in model.second_round_parameters():
-                #             if param.grad is not None:
-                #                 param.grad.data.clamp_(-grad_clamp, grad_clamp)
-                #         opt_2.step()
-                # opt = opt_2
-
-
-
-            # new_alpha_beta, _ =  model(x=(batch_g, (raw_traffic, y), weeks, minutes, first_layer_idx, mask, sim_mask),auxillary=True)
-
-            # opt.zero_grad()
-            # alpha_beta, predict = model(x=(batch_g, raw_traffic, weeks, minutes, first_layer_idx, mask, sim_mask),first_round=True)
-            # minibatch_loss = criterion(predict, y, mask, sim_mask, reduction=True)
+                
             
             opt.zero_grad()  
             alpha_beta1, alpha_beta2, predict1, predict2 = model(x=(batch_g, (raw_traffic, y), weeks, minutes, first_layer_idx, mask, sim_mask),sim=True)
@@ -335,47 +272,6 @@ def train2(model, dataloader, val_dataloader, criterion, criterion_2, opt, opt_2
             # sim_loss =  criterion_2(alpha_beta, new_alpha_beta.detach(), mask, sim_mask, reduction=True)
             sim_loss =  criterion_2(alpha_beta1, alpha_beta2, mask, sim_mask, reduction=True)
             if use_sim:
-                    # # super_model = SupConLoss()
-                    # # 随机采样10000个样本，如果不够的话就用全部的，然后构造样本的
-                    # # # 通过mgda自适应地选择weight
-                    # scales = {}
-                    # grads = {}
-                    # loss_data = {}
-                    # # loss_list = [sim_loss1, sim_loss3]
-                    # loss_list = [minibatch_loss, sim_loss]
-                    # for pp, tt in enumerate(loss_list):
-                    #     opt.zero_grad()
-                    #     grads[pp] = []
-                    #     loss_data[pp] = tt.item()
-                    #     tt.backward(retain_graph=True)
-                    #     for param in model.parameters():
-                    #         if param.grad is not None:
-                    #             grads[pp].append(Variable(param.grad.data.clone(), requires_grad = False))
-                    # gn = util.gradient_normalizers(grads, loss_data, "l2")
-                    # # print(gn)
-                    # for t, g in grads.items():
-                    #     for gr_i in range(len(g)):
-                    #         grads[t][gr_i] = grads[t][gr_i] / gn[t]
-
-                    # # print(grads)
-                    # try:
-                    #     sol, min_norm = util.MinNormSolver.find_min_norm_element([grads[t] for t in grads.keys()])
-                    # except Exception as err:
-                    #     sol, min_norm  = None, None
-                    # for t, _ in grads.items():
-                    #     scales[t]  = float(sol[t]) if sol is not None else None
-                    # opt.zero_grad()
-                    # # loss = 0.0
-                    # for i in range(len(loss_list)):
-                    #     sl = scales[i]
-                    #     if sl is None or np.isnan(sl) or np.isinf(sl):
-                    #         sl = 1.0
-                    #     if i == 0:
-                    #         loss = loss_list[i] * sl
-                    #     else:
-                    #         loss = loss + loss_list[i] * sl
-
-                    # loss = loss + sim_loss + minibatch_loss2
                     loss = loss + lambda_weight * (sim_loss + minibatch_loss2)
             
             # opt_2.zero_grad()
@@ -410,61 +306,27 @@ def L1Loss(model,beta):
             l1_loss = l1_loss + beta * torch.sum(torch.abs(parma))
     return l1_loss
 
-# def train(model, criterion, opt, loader, grad_clamp=1):
-#     model.train()
-#     train_loss = []
-#     # valid_value_num = 0
-#     for _ in tqdm(range(batch_per_ep)):
-#         # print("data size:", len(data))
-#         # try:
-#         data = next(loader)
-#         first_layer_idx, weeks, minutes, batch_g, x, y, mask, sim_mask = data
-#         first_layer_idx, weeks, minutes, batch_g, x, y, mask, sim_mask = \
-#             first_layer_idx.to(device, non_blocking=True), weeks.to(device, non_blocking=True), \
-#                 minutes.to(device, non_blocking=True), batch_g.to(device), \
-#                     x.to(device, non_blocking=True), y.to(device, non_blocking=True), \
-#                         mask.to(device, non_blocking=True), sim_mask.to(device, non_blocking=True)
 
-#         opt.zero_grad()
-#         batch_g.ndata['traffic'] = x
-#         batch_g.ndata['mask'] = mask.float()
-
-#         predict = model(x=(batch_g, x, weeks, minutes, first_layer_idx, mask, sim_mask),first_round=True)[-1]
-#         minibatch_loss = criterion(predict, y, mask, sim_mask, reduction=True)
-#         if minibatch_loss is None:
-#             continue
-#         # minibatch_loss = torch.mean(minibatch_loss)
-#         # l2_loss = L2Loss(model,0.001)
-#         # l1_loss = L1Loss(model,0.001)
-#         total_loss =  minibatch_loss
-#         # minibatch_loss.backward()
-#         total_loss.backward()
-#         for param in model.parameters():
-#             if param.grad is not None:
-#                 param.grad.data.clamp_(-grad_clamp, grad_clamp)
-#         opt.step()
-#         train_loss.append(minibatch_loss.cpu().detach().numpy())
-#         torch.cuda.empty_cache()
-#     if len(train_loss) == 0:
-#         return None
-#     return np.mean(train_loss)
-
+#通过batch_g获得一个batch的权重
 
 import torchmetrics
-def validation(model, dataloader, avg_speed_tensor, resort_data = False):
+def validation(model, dataloader, avg_speed_tensor, weight_tensor):
     model.eval()
     import data as datap
     kl_metric_ha = nn.KLDivLoss(reduction="batchmean").to(device)
     kl_metric_pre = nn.KLDivLoss(reduction="batchmean").to(device)
+    kl_metric_raw = nn.KLDivLoss(reduction="none").to(device)
     mse_metric_pre_detail = nn.MSELoss(reduction="none").to(device)
     mse_metric_pre = nn.MSELoss(reduction="mean").to(device)
+    mse_metric_raw = nn.MSELoss(reduction="none").to(device)
     ha_loss, pre_loss1, mse_loss1, pre_loss2, mse_loss2 =  [], [], [], [], []
+    pre_loss_weight, mse_loss_weight = [],[]
     # pre_loss_detail = []
     with torch.no_grad():
         # total_num, delta_num = 0, 0
         # for data in tqdm(dataloader):
         # batch_loss_record = []
-        for _ in tqdm(range(batch_per_ep if resort_data is False else 100000000)):
+        for _ in tqdm(range(int(batch_per_ep))):
             try:
                 data = next(dataloader)
             except StopIteration:
@@ -488,6 +350,9 @@ def validation(model, dataloader, avg_speed_tensor, resort_data = False):
             # if len(pre_loss_detail) == 0:
             #     print("tmp", len(tmp))
             # pre_loss_detail += tmp
+            #获取权重
+            weight = weight_tensor.index_select(0, batch_g.ndata['spatial_idx']).unsqueeze(1).repeat(1, x.shape[1])
+            weight = torch.masked_select(weight, mask > 0).reshape([-1, 1])
 
             mask = mask.unsqueeze(2).repeat(1,1,datap.MyTrafficDataset.in_dim)
             sim_mask = sim_mask.unsqueeze(2).repeat(1,1,datap.MyTrafficDataset.in_dim)
@@ -501,6 +366,10 @@ def validation(model, dataloader, avg_speed_tensor, resort_data = False):
             
             y_ha = avg_speed_tensor.index_select(0, batch_g.ndata['spatial_idx']).unsqueeze(1).repeat(1, x.shape[1], 1)
             y_ha = torch.masked_select(y_ha, mask > 0).reshape([-1, datap.MyTrafficDataset.in_dim])
+
+            
+
+            
             
             y_ha = (y_ha + epsilon)/torch.sum(y_ha + epsilon, dim=-1, keepdim=True)
             y = (y + epsilon)/torch.sum(y + epsilon, dim=-1, keepdim=True)
@@ -516,12 +385,18 @@ def validation(model, dataloader, avg_speed_tensor, resort_data = False):
             mse_loss1.append(mse_metric_pre(y_pre1, y).cpu().detach().numpy())
             pre_loss2.append(kl_metric_pre(y_pre2.log(), y).cpu().detach().numpy())
             mse_loss2.append(mse_metric_pre(y_pre2, y).cpu().detach().numpy())
+
+            #
+            pre_loss_weight.append((torch.sum(torch.sum(kl_metric_raw(y_pre1.log(), y), dim=1, keepdim=True)*weight)/(torch.sum(weight))).cpu().detach().numpy())
+            mse_loss_weight.append((torch.sum(mse_metric_raw(y_pre1, y)*weight)/(torch.sum(weight.repeat(1, y_pre1.shape[1])))).cpu().detach().numpy())
             torch.cuda.empty_cache()
+            # 记录每个batch的weight
+
     if len(pre_loss1) == 0 or len(ha_loss) == 0 or len(mse_loss1) == 0\
-        or len(pre_loss2) == 0 or len(mse_loss2) == 0:
+        or len(pre_loss_weight) == 0 or len(mse_loss_weight) == 0:
         return None
     return mse_loss1, (np.mean(pre_loss1)/np.mean(ha_loss), np.mean(mse_loss1)), \
-        (np.mean(pre_loss2)/np.mean(ha_loss), np.mean(mse_loss2))
+        (np.mean(pre_loss_weight)/np.mean(ha_loss), np.mean(mse_loss_weight))
     # else:
     #     return (np.mean(pre_loss1)/np.mean(ha_loss), np.mean(mse_loss1)), \
     #     (np.mean(pre_loss2)/np.mean(ha_loss), np.mean(mse_loss2))
@@ -594,12 +469,12 @@ def rep_loss_2(rep1, rep2, mask, sim_mask, reduction=False):
 
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
-
+    abc = pickle.load(open(edge_file,"rb"))
+    edge_size = max(list(abc[1].keys())) + 1
+    
     avg_speed_file = parser.avg_speed_file
     avg_speed_tensor = None
     if avg_speed_file is not None:
-        abc = pickle.load(open(edge_file,"rb"))
-        edge_size = max(list(abc[1].keys())) + 1
         assert edge_size > 0
         avg_speed_list = [None for _ in range(edge_size)]
         hist_size = None
@@ -609,13 +484,21 @@ if __name__ == '__main__':
             avg_speed_list[lid] = [float(t) for t in line[1:]]
             if hist_size is None:
                 hist_size = len(line) - 1
-        # check 所有none的
+        # check 所有none的，或者根据mask_rate进行掩码(只剩下)
         for i, v in enumerate(avg_speed_list):
-            if v is None:
+            if v is None or random.random() <= mask_rate:
                 avg_speed_list[i] = [round(1.0/hist_size, 2) for _ in range(hist_size)]
         avg_speed_tensor = torch.FloatTensor(avg_speed_list).to(device)
-        # avg_speed_tensor = torch.exp(avg_speed_tensor)
-        # avg_speed_tensor = torch.softmax(avg_speed_tensor+1.0/8, dim=-1)
+
+    weight_tensor = None
+    if weight_file is not None:
+        weight_list = [0 for _ in range(edge_size)]
+        for line in open(weight_file, "r"):
+            line = line.strip().split("\t")
+            lid = int(line[0])
+            weight_list[lid] = float(line[1])
+        weight_tensor = torch.FloatTensor(weight_list).to(device)
+
     
     train_dataset = data.MyTrafficDatasetPath(
         file_path=training_file,
@@ -640,10 +523,6 @@ if __name__ == '__main__':
     
     train_dataloader = iter(DataLoader(train_dataset, collate_fn= my_collate_fn, \
         shuffle=False, batch_size=train_batch_size, num_workers=num_workers))
-    # val_dataloader = DataLoader(val_dataset, collate_fn= my_collate_fn, \
-    #     shuffle=False, batch_size=test_batch_size, num_workers=num_workers)
-    # meta_dataloader = itertools.cycle(DataLoader(train_dataset, collate_fn= my_collate_fn, \
-    #     shuffle=False, batch_size=train_batch_size))
 
     # 构造model
     in_dim, spatial_feature_dim = data.MyTrafficDataset.in_dim, data.MyTrafficDataset.spatial_feature_dim
@@ -664,17 +543,6 @@ if __name__ == '__main__':
     meta_model.to(device)
     
     
-    # meta_target_model = model.MetaSTC(in_dim, spatial_feature_dim,
-    #                 out_spatial_dim, out_temporal_dim, graph_layer, 
-    #                 rnn_layer, spatial_context_dim, temporal_context_dim,
-    #                 region_nums, link_nums, region_edges, hidden_size, avg_speed_tensor=avg_speed_tensor, device=device)
-    # meta_target_model.to(device)
-    # meta_model.share_memory()
-    # mp.set_start_method('spawn')
-
-    # if use_sim:
-    #     opt = optim.Adam(meta_model.first_round_parameters(), lr=lr, weight_decay=weight_decay)
-    # else:
     opt = optim.Adam(meta_model.parameters(), lr=lr, weight_decay=weight_decay)
     opt_2 = optim.Adam(meta_model.second_round_parameters(), lr=lr, weight_decay=weight_decay)
     # opt_2 = optim.Adam(meta_model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -683,10 +551,7 @@ if __name__ == '__main__':
     writer = SummaryWriter('{}/log'.format(proj_dir))
     time_flag = str(int(time.time())-1600000000)
     
-    if test:
-        # if resort_data is False:
-        #     test_file = new_test_file
-        #     num_workers = 0
+    def test_fun():
         print("the test file is:{}".format(test_file))
         test_dataset = data.MyTrafficDataset(
             file_path=test_file,
@@ -696,41 +561,50 @@ if __name__ == '__main__':
         test_dataloader = iter(DataLoader(test_dataset, collate_fn= my_collate_fn, \
             shuffle=False, batch_size=test_batch_size, num_workers=num_workers, drop_last = True))
         
-        model_name = "{}/model/{}_Meta_model_{}_{}_{}_{}_{}_{}_".format(proj_dir,city, use_meta, use_sim, use_global, use_local, use_fusion, interval_size)
+        model_name = "{}/model/{}_Meta_model_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_".format(proj_dir,city, use_meta, use_sim, use_global, use_local, use_fusion, interval_size, data_ratio, hist_size, time_slot_num, mask_rate)
+        
+
         files = glob.glob(model_name+"*")
     #     print(file_pre,files)
-        files_suf = [list(map(int, f[len(model_name):f.index(".pt")].split("_"))) for f in files]
-        
-        start_epoch = 0
+        files_suf = [list(map(int, f[len(model_name):f.index(".pt")].split("_")[-2:])) for f in files]
+
+        if len(files_suf) == 0:
+            model_name = "{}/model/{}_Meta_model_{}_{}_{}_{}_{}_{}_".format(proj_dir,city, use_meta, use_sim, use_global, use_local, use_fusion, interval_size)
+            files = glob.glob(model_name+"*")
+        #     print(file_pre,files)
+            files_suf = [list(map(int, f[len(model_name):f.index(".pt")].split("_")[-2:])) for f in files]
+        assert len(files_suf) > 0
         if len(files)>0:
             load_f = files[np.argmax([sum(t) for t in files_suf])]
             print("the model file is: ", load_f)
             meta_model.load_state_dict(torch.load(load_f))
         
-        # r
-        pre_loss1, epoch_loss_val_1, epoch_loss_val_2= validation(meta_model, test_dataloader, avg_speed_tensor, resort_data)
+        print("the model name's prefix is:{}".format(model_name))
+
+        pre_loss1, epoch_loss_val_1, epoch_loss_val_2= validation(meta_model, test_dataloader, avg_speed_tensor, weight_tensor)
         
-        # if resort_data:
-        #     test_dataset._resort_data_and_rewrite(pre_loss1, test_batch_size, new_test_file)
+    
             
         print("Validation_MKLR_Loss_1r: {},  Validation_MSE_Loss_1r: {}".format(epoch_loss_val_1[0], epoch_loss_val_1[1]))
         print("Validation_MKLR_Loss_2r: {},  Validation_MSE_Loss_2r: {}".format(epoch_loss_val_2[0], epoch_loss_val_2[1]))
         
+    if test:
+        test_fun()
     else:
         for ep in range(1,epochs+1):
                 
                 val_dataloader_unlimit = iter(DataLoader(val_dataset_unlimit, collate_fn= my_collate_fn, \
             shuffle=False, batch_size=test_batch_size, num_workers=num_workers))
                 
-                # epoch_loss, epoch_sim_loss = train2(meta_model, train_dataloader, val_dataloader_unlimit, traffic_loss, rep_loss_2, opt, opt_2, grad_clamp=grad_clamp, use_meta=use_meta, epoch=ep)
+                epoch_loss, epoch_sim_loss = train2(meta_model, train_dataloader, val_dataloader_unlimit, traffic_loss, rep_loss_2, opt, opt_2, grad_clamp=grad_clamp, use_meta=use_meta, epoch=ep)
                 # epoch_loss = train(meta_model, traffic_loss, opt, train_dataloader, grad_clamp=grad_clamp)
                 
                 val_dataloader = iter(DataLoader(val_dataset, collate_fn= my_collate_fn, \
             shuffle=False, batch_size=test_batch_size, num_workers=num_workers))
-                _, epoch_loss_val_1, epoch_loss_val_2= validation(meta_model, val_dataloader, avg_speed_tensor)
-                break
+                _, epoch_loss_val_1, epoch_loss_val_2= validation(meta_model, val_dataloader, avg_speed_tensor, weight_tensor)
+                # break
                 
-                key = "{}_{}_{}_{}_{}_{}_{}_{}".format(use_meta, use_sim, use_global, use_local, use_fusion, interval_size, data_ratio, time_flag)
+                key = "{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}".format(use_meta, use_sim, use_global, use_local, use_fusion, interval_size, data_ratio, hist_size, time_slot_num, mask_rate, time_flag)
                 writer.add_scalars('{}_Meta/Train_Loss'.format(city), {key : epoch_loss}, ep)
                 writer.add_scalars('{}_Meta/Train_Minibatch_Loss'.format(city), {key :epoch_sim_loss[0]}, ep)
                 writer.add_scalars('{}_Meta/Train_Sim_Loss'.format(city), {key :epoch_sim_loss[1]}, ep)
@@ -746,6 +620,5 @@ if __name__ == '__main__':
                     last_best_ep = ep
                 if ep - last_best_ep > early_stop_epoch:
                     break
-            
-    
+        test_fun()
        
